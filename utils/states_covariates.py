@@ -6,8 +6,12 @@ import re
 from utils.id_map_mxstates import abr_to_state_code, state_name_to_abr
 import warnings
 
-INPUT_DIR = Path("input")
-OUTPUT_DIR = Path("resultados")
+BASE_DIR = Path(__file__).resolve().parent.parent
+INPUT_DIR = BASE_DIR / "input"
+OUTPUT_DIR = BASE_DIR / "resultados"
+
+# Ensure output directory exists
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def clean_column_names(df):
     new_cols = []

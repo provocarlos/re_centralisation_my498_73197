@@ -1,6 +1,5 @@
 ---
 title: Impact of IMSS-Bienestar Affiliation on Out-of-Pocket Health Expenditure in Mexico
-author: Carlos Mora
 date: '2026-05-18'
 format:
   html:
@@ -22,7 +21,7 @@ amount, weighted by the ENIGH expansion factor). ~39% of households report zero 
 spending, and PPML handles that zero mass natively — unlike `log(1 + y)`, which gives
 semi-elasticities that aren't invariant to the added constant (Chen & Roth 2024; Bellemare &
 Wichman 2020) and, as §6 shows, materially overstates the effect here. Log-OLS and WLS are
-reported in §6 as secondary comparisons.
+reported as secondary comparisons.
 :::
 
 ```{python}
@@ -83,15 +82,6 @@ plt.savefig('resultados/figures/fig_parallel_trends_oophe.pdf', bbox_inches='tig
 plt.show()
 ```
 
-::: {.callout-note}
-**Treatment timing.** Most states' IMSS-Bienestar affiliation was adopted between 2020 and 2021,
-replacing Seguro Popular/INSABI. ENIGH survey waves are biannual (2016, 2018, 2020, 2022, 2024),
-so `post = year >= 2020` places the entire adoption window at or after the first post-period wave
-— 2018 is unambiguously pre-treatment and 2022/2024 are unambiguously post-treatment, with 2020
-itself sitting right at the boundary. §6 checks robustness to this by also estimating with
-`post = year >= 2018` and `post = year >= 2022`, and by dropping 2020 entirely.
-:::
-
 ## 3. Data Preparation
 
 ```{python}
@@ -114,14 +104,6 @@ state_covariate_cols = [c for c in df_states.columns if c not in ('state_code', 
 print(f"Household controls: {household_controls}")
 print(f"State covariates:   {state_covariate_cols}")
 ```
-
-::: {.callout-note}
-`treated`, raw `year`, and `post_treatment` are excluded from the regressors: state and year fixed
-effects absorb those main effects in a standard two-way fixed-effects design, so only
-`treated_x_post` is needed to identify the DiD effect. `public_attention` (choice of provider) is
-also excluded — it is jointly determined with OOP spending, the same decision made at the same
-time, so including it would be a bad control.
-:::
 
 ## 4. Event Study
 
@@ -213,12 +195,6 @@ print(f"Treated x Post: {te['pct_change']:+.1f}% change in expected OOP spend "
       f"(95% CI: {100*(np.exp(ci_lo)-1):+.1f}% to {100*(np.exp(ci_hi)-1):+.1f}%, p={te['p_value']:.3f})")
 ```
 
-::: {.callout-warning}
-**Cluster-robust SE with few clusters.** There are only 32 state clusters (24 treated / 8
-control); treat asymptotic cluster-robust SEs as a first pass, and consider a wild cluster
-bootstrap for the final paper.
-:::
-
 ## 6. Robustness Checks
 
 ```{python}
@@ -259,9 +235,7 @@ model_alt_2022, col_2022 = fit_alt_cutoff(2022)
 
 # Excluding 2020 entirely — 2020 is the year IMSS-Bienestar adoption was actually rolling out
 # across states, so it's the least clean "post" observation under a single common cutoff.
-# Dropping it and re-estimating with only 2016/2018 (pre) vs. 2022/2024 (post) checks whether
-# that one ambiguous year is doing the work. The y_2020 dummy is dropped too, since it would be
-# identically zero (and uninformative) once every 2020 row is removed.
+
 df_excl2020 = df_reg_f[df_reg_f['year'] != 2020].copy()
 year_cols_excl2020 = [c for c in year_dummies.columns if c != 'y_2020']
 x_cols_excl2020 = ['treated_x_post'] + household_controls + state_covariate_cols + year_cols_excl2020 + list(state_dummies.columns)
@@ -297,61 +271,14 @@ robustness = pd.DataFrame([
 ])
 robustness['signif'] = robustness['p-value'].apply(sig_stars)
 robustness['pct_change'] = 100 * (np.exp(robustness['Coef.']) - 1)
-# The logit row's "Coef." is an average marginal effect on P(any spending), in probability points
-# — not a log-coefficient, so exponentiating it wouldn't represent a %-change.
+# The logit row's "Coef." is an average marginal effect on P(any spending), in probability points.
 robustness.loc[robustness['Specification'].str.contains('logit'), 'pct_change'] = np.nan
 robustness
 ```
 
-### Interpretation
-
-**The main model finds a +23.0% increase in expected out-of-pocket spending** (95% CI: +8.7% to
-+39.2%, p=0.001). The seven-row comparison above:
-
-| Specification | %Δ | p-value | Significant? |
-|---|---|---|---|
-| **Main: PPML, survey-weighted (post = 2020)** | **+23.0%** | **0.001** | **Yes** |
-| Log-OLS on log(1+y) | +28.8%¹ | 0.045 | Yes |
-| WLS on log(1+y), weighted | +50.6%¹ | 0.027 | Yes |
-| Extensive margin: logit AME | +4.1 pp² | 0.036 | Yes |
-| PPML, weighted, post = 2018 | +25.7% | 0.003 | Yes |
-| PPML, weighted, post = 2022 | +4.1% | 0.419 | No |
-| PPML, weighted, excluding 2020 | +17.0% | 0.027 | Yes |
-
-¹ log-scale semi-elasticities on `log(1+y)`, not directly comparable in magnitude to PPML's %Δ on
-the natural scale. ² percentage-point change in the probability of *any* OOP spending, not a
-%-change in the amount.
-
-**The result is sensitive to how the 2020 survey wave is classified, though this 8-state control
-group is markedly more robust to that choice than a narrower one.** Moving the cutoff earlier
-(`post = 2018`, which reclassifies nothing about 2020 itself but changes the pre-period to a
-single year) *strengthens* the effect to +25.7% (p=0.003). Moving it later (`post = 2022`, which
-reclassifies 2020 as pre-treatment) all but eliminates it: +4.1%, p=0.419 — the one specification
-under which the effect is not detectable. Dropping 2020 from the sample entirely now yields a
-result that remains significant: +17.0% (p=0.027) — unlike under a narrower control group, this
-check no longer loses significance once 2020 is set aside.
-
-This pattern is exactly what you'd expect if IMSS-Bienestar affiliation was genuinely still rolling
-out through 2020-2021 (per §2): the 2020 ENIGH wave likely captured a mix of already-affiliated and
-not-yet-affiliated treated states. Whether that wave is coded "post" (as in the main model) or
-"pre" (as in the `post = 2022` check) materially changes the answer, because it is the one wave
-where the coding is genuinely ambiguous rather than a matter of estimator choice. The log-based
-checks (log-OLS, WLS) agree in direction and, under this control group, both clear conventional
-significance in their own right, as does the extensive-margin logit check.
-
-**My read: there is a positive point estimate under every specification, and statistical
-confidence now extends to five of the seven checks, not just the two that treat 2020 as "post" —
-this is a real and comparatively robust finding, though still not fully settled.** `post = 2022` is
-the one specification that fails to detect an effect; I would still report it alongside the
-headline number rather than omit it, since it is the cleanest test of whether coding 2020 as
-"post" is doing the work. The honest summary is "OOP spending appears to have risen after
-affiliation, robust to most but not all ways of handling the ambiguous 2020 transition wave."
 
 ## 7. Marginal Effect Plots
 
-Each panel shows the **partial relationship** between one predictor and predicted OOP spending,
-holding all other predictors at their sample mean, using the main model (§5). Since PPML is a
-log-link model, predictions are computed on the log scale and exponentiated back to pesos.
 
 ```{python}
 #| label: fig-marginal-plots
@@ -524,31 +451,3 @@ plt.show()
 print('Effect plot saved to resultados/effect_plot_corrected_oophe.png and resultados/figures/fig_effect_plot_oophe.{svg,pdf}')
 ```
 
-## Conclusion
-
-1. **The main model finds a +23.0% increase in expected out-of-pocket health spending following
-   IMSS-Bienestar affiliation** (95% CI +8.7% to +39.2%, p=0.001), and this holds up well across
-   most, though not all, ways of handling the ambiguous 2020 transition wave: the effect
-   strengthens under an earlier cutoff (`post = 2018`: +25.7%, p=0.003), remains significant when
-   2020 is dropped from the sample entirely (+17.0%, p=0.027), and is only rendered statistically
-   indistinguishable from zero under the later cutoff (`post = 2022`: +4.1%, p=0.419). Every
-   specification checked is directionally positive; five of seven reach conventional significance.
-2. **This still points to 2020 as the pivotal, genuinely ambiguous survey wave** — consistent with
-   affiliation rolling out through 2020-2021 rather than on a single date — but the finding is
-   noticeably less fragile to that choice than under a narrower control group: only the `post =
-   2022` recoding eliminates it, rather than both `post = 2022` and excl-2020 together. The paper
-   should still present the `post = 2020` result as the primary estimate but report `post = 2022`
-   alongside it as the one specification under which the effect is not detectable.
-3. **The traditional log-OLS/WLS approach agrees in direction** (+28.8% and +50.6%, respectively)
-   and, under this control group, both clear conventional significance (p=0.045 and p=0.027), no
-   longer only marginally so — though both still inflate the magnitude relative to PPML, consistent
-   with `log(1+y)` semi-elasticities being unreliable when a large zero mass is present (here, ~39%
-   of households report no OOP spending).
-4. **Household income and economic dependency are the strongest predictors of OOP spending**
-   (see §8): a one-unit increase in log household income is associated with a +140% increase in
-   expected OOP spend, and a one-unit increase in the economic dependency ratio with +72% — both
-   descriptive associations among controls, not causal claims, since neither is randomly assigned.
-5. **State-level supply covariates (hospital beds, doctors, outpatient consultations per 100k) are
-   not significant predictors** of household OOP spending once state and year fixed effects are
-   included — expected, since most of their variation is absorbed by the state fixed effects,
-   leaving only within-state, within-year movements to identify them.

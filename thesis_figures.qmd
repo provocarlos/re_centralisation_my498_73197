@@ -1,6 +1,5 @@
 ---
 title: Thesis Figures — Mexico Health (Re)centralisation and Out-of-Pocket Spending
-author: Carlos Mora
 date: '2026-05-18'
 format:
   html:
@@ -9,22 +8,6 @@ format:
     embed-resources: true
 jupyter: python3
 ---
-
-::: {.callout-note}
-This notebook is the single source for every figure used in `mexico_health_recentralisation_draft.md`
-(main text and appendix). It does not introduce any new specification — every model here is a
-direct copy of the code in `regression_results_oophe.qmd` (main model, event study, robustness
-checks) and `regression_results_subcategories.qmd` (per-subcategory PPML). If you change a
-specification in either of those notebooks, the matching cell here must be updated too, or the
-figures will silently drift out of sync with the numbers reported in the text. Those two notebooks
-also now save their own copies of the figures they produce (parallel trends, event study, effect
-plot), to the same file paths used here, as a cross-check.
-
-**File formats.** Every figure is saved as both **SVG** (crisp at any scale, natively supported by
-modern Word/Google Docs and by direct embedding in HTML) and **PDF** (the native vector format for
-`\includegraphics` under pdflatex/xelatex, needing no extra LaTeX packages) — covering either
-thesis pipeline without guessing which one you're using. Figures are saved to `resultados/figures/`.
-:::
 
 ```{python}
 import numpy as np
@@ -37,8 +20,6 @@ from statsmodels.stats.weightstats import DescrStatsW
 import warnings
 warnings.filterwarnings('ignore')
 
-# 'seaborn-whitegrid' was renamed to 'seaborn-v0_8-whitegrid' in Matplotlib 3.6+; fall back
-# to the pre-3.6 name so this still works on older installs.
 plt.style.use('seaborn-v0_8-whitegrid')
 
 FIGDIR = Path("resultados/figures")
@@ -139,7 +120,7 @@ es_errs  = [model_es.bse.get(f'event_{y}', 0) * 1.96 for y in years_plot]
 
 ```{python}
 #| label: setup-robustness
-# Mirrors regression_results_oophe.qmd §6
+
 y_log = data_did['log_oop_expenditure'].astype(float)
 model_log_ols = sm.OLS(y_log, X_did).fit(cov_type='cluster', cov_kwds={'groups': data_did['state_code']})
 model_wls = sm.WLS(y_log, X_did, weights=data_did['factor']).fit(
@@ -189,7 +170,7 @@ spec_df
 
 ```{python}
 #| label: setup-subcategory-models
-# Mirrors regression_results_subcategories.qmd's fit_main_model + income trim
+
 SUBCATEGORIES = ['medicines', 'hospital', 'outpatient_care']
 SUBCAT_LABELS = {'oop_expenditure': 'Total OOP spending', 'medicines': 'Medicines',
                   'hospital': 'Hospital', 'outpatient_care': 'Outpatient care'}
@@ -217,7 +198,10 @@ df_raw_subcat = df_raw_subcat[df_raw_subcat['income'] <= df_raw_subcat['income']
 
 subcat_results = {}
 for col in SUBCATEGORIES + ['oop_expenditure']:
-    m, d = fit_main_model(df_raw_subcat, col, df_states)
+    if col == 'oop_expenditure':
+        m, d = model_did, data_did
+    else:
+        m, d = fit_main_model(df_raw_subcat, col, df_states)
     subcat_results[col] = {'model': m, 'N': len(d)}
     print(f"Fitted {col:16s}  N={len(d):,}  %Δ={100*(np.exp(m.params['treated_x_post'])-1):+.1f}%  "
           f"p={m.pvalues['treated_x_post']:.3f}")
@@ -227,12 +211,6 @@ for col in SUBCATEGORIES + ['oop_expenditure']:
 
 # Main Text Figures
 
-::: {.callout-note}
-**Figure 0 (not built here): treated/control state map.** A choropleth of Mexico's 32 states
-shaded by treatment status would be a strong complement to Section 3.1/6.1, but requires a
-state-boundary shapefile (e.g., INEGI's Marco Geoestadístico) that isn't in this repository. If you
-add one under `input/`, this notebook can build it — flag it and I'll wire it in.
-:::
 
 ## Figure 1. Parallel Trends and Event Study
 
@@ -412,8 +390,6 @@ X_mean = data_did[x_cols_did].astype(float).mean()
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
-# Panel A: log income, binned means (no raw scatter — ~290k points renders as an unreadable
-# cloud and inflates SVG file size substantially)
 ax = axes[0]
 tmp = data_did[['log_income', 'oop_expenditure']].copy()
 tmp['_bin'] = pd.qcut(tmp['log_income'], 20, duplicates='drop')
@@ -432,7 +408,6 @@ ax.set_title('A. Log Household Income', fontsize=10, fontweight='bold')
 ax.set_xlabel('Log household income'); ax.set_ylabel('OOP spend (pesos)')
 ax.legend(fontsize=8); ax.grid(alpha=0.25)
 
-# Panel B: treated_x_post, predicted E[y] at 0 vs 1 holding other covariates at sample mean
 ax = axes[1]
 preds01 = []
 for val in [0, 1]:
