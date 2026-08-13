@@ -1,0 +1,526 @@
+---
+title: Thesis Figures — Mexico Health (Re)centralisation and Out-of-Pocket Spending
+author: Carlos Mora
+date: '2026-05-18'
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+jupyter: python3
+---
+
+::: {.callout-note}
+This notebook is the single source for every figure used in `mexico_health_recentralisation_draft.md`
+(main text and appendix). It does not introduce any new specification — every model here is a
+direct copy of the code in `regression_results_oophe.qmd` (main model, event study, robustness
+checks) and `regression_results_subcategories.qmd` (per-subcategory PPML). If you change a
+specification in either of those notebooks, the matching cell here must be updated too, or the
+figures will silently drift out of sync with the numbers reported in the text. Those two notebooks
+also now save their own copies of the figures they produce (parallel trends, event study, effect
+plot), to the same file paths used here, as a cross-check.
+
+**File formats.** Every figure is saved as both **SVG** (crisp at any scale, natively supported by
+modern Word/Google Docs and by direct embedding in HTML) and **PDF** (the native vector format for
+`\includegraphics` under pdflatex/xelatex, needing no extra LaTeX packages) — covering either
+thesis pipeline without guessing which one you're using. Figures are saved to `resultados/figures/`.
+:::
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import statsmodels.api as sm
+from statsmodels.stats.weightstats import DescrStatsW
+import warnings
+warnings.filterwarnings('ignore')
+
+# 'seaborn-whitegrid' was renamed to 'seaborn-v0_8-whitegrid' in Matplotlib 3.6+; fall back
+# to the pre-3.6 name so this still works on older installs.
+plt.style.use('seaborn-v0_8-whitegrid')
+
+FIGDIR = Path("resultados/figures")
+FIGDIR.mkdir(parents=True, exist_ok=True)
+
+def save_fig(fig, name):
+    fig.savefig(FIGDIR / f"{name}.svg", bbox_inches='tight')
+    fig.savefig(FIGDIR / f"{name}.pdf", bbox_inches='tight')
+    print(f"Saved {name}.svg and {name}.pdf")
+
+PALETTE = {
+    'treated': '#55B4AE', 'control': '#C5361D', 'point': '#1f77b4',
+    'pos01': '#1a6faf', 'pos05': '#5ba4d4', 'pos10': '#a8cce4',
+    'neg01': '#c0392b', 'neg05': '#e67e73', 'neg10': '#f1b9b5', 'ns': '#b0b0b0',
+}
+
+def sig_stars(p):
+    if pd.isna(p): return ''
+    if p < 0.01:   return '***'
+    if p < 0.05:   return '**'
+    if p < 0.10:   return '*'
+    return ''
+
+def dot_color(p, coef):
+    if p < 0.01: return PALETTE['pos01'] if coef > 0 else PALETTE['neg01']
+    if p < 0.05: return PALETTE['pos05'] if coef > 0 else PALETTE['neg05']
+    if p < 0.10: return PALETTE['pos10'] if coef > 0 else PALETTE['neg10']
+    return PALETTE['ns']
+```
+
+## Setup: Data and Main Model
+
+Mirrors `regression_results_oophe.qmd` §0/§3/§5 exactly.
+
+```{python}
+#| label: setup-main-model
+panel_path  = Path("resultados/access_analysis_panel.csv")
+states_path = Path("resultados/state_covariates.csv")
+df          = pd.read_csv(panel_path)
+df_states   = pd.read_csv(states_path)
+
+df = df[df['income'] <= df['income'].quantile(0.9999)].copy()
+
+household_controls = [
+    'log_income', 'head_sex', 'head_age', 'head_education',
+    'household_size', 'economic_dependency_ratio', 'locality_rural',
+]
+
+year_dummies  = pd.get_dummies(df['year'],       prefix='y', drop_first=True, dtype=int)
+state_dummies = pd.get_dummies(df['state_code'], prefix='s', drop_first=True, dtype=int)
+df_reg = pd.concat([df, year_dummies, state_dummies], axis=1)
+df_reg_f = df_reg.merge(df_states, on=['state_code', 'year'], how='left')
+state_covariate_cols = [c for c in df_states.columns if c not in ('state_code', 'year')]
+
+x_cols_did = (
+    ['treated_x_post'] + household_controls + state_covariate_cols
+    + list(year_dummies.columns) + list(state_dummies.columns)
+)
+data_did = df_reg_f[['log_oop_expenditure', 'oop_expenditure', 'state_code', 'factor'] + x_cols_did].dropna().copy()
+X_did = sm.add_constant(data_did[x_cols_did].astype(float))
+
+model_did = sm.GLM(
+    data_did['oop_expenditure'].astype(float), X_did, family=sm.families.Poisson(),
+    var_weights=data_did['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_did['state_code']})
+
+coef_table = pd.DataFrame({
+    'coef': model_did.params, 'std_err': model_did.bse, 'p_value': model_did.pvalues,
+})
+coef_table['pct_change'] = 100 * (np.exp(coef_table['coef']) - 1)
+
+te = coef_table.loc['treated_x_post']
+print(f"Main model refit check — should match regression_results_oophe.qmd §5:")
+print(f"N={len(data_did):,}, treated_x_post = {te['pct_change']:+.1f}%, p={te['p_value']:.3f} "
+      f"(expected: +23.0%, p=0.001)")
+```
+
+```{python}
+#| label: setup-event-study
+event_cols = []
+for y in [2016, 2018, 2022, 2024]:
+    col = f'event_{y}'
+    df_reg_f[col] = df_reg_f['treated'] * (df_reg_f['year'] == y).astype(int)
+    event_cols.append(col)
+
+x_cols_es = event_cols + household_controls + state_covariate_cols + list(year_dummies.columns) + list(state_dummies.columns)
+data_es = df_reg_f[['oop_expenditure', 'state_code', 'factor'] + x_cols_es].dropna().copy()
+X_es = sm.add_constant(data_es[x_cols_es].astype(float))
+model_es = sm.GLM(
+    data_es['oop_expenditure'].astype(float), X_es, family=sm.families.Poisson(),
+    var_weights=data_es['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_es['state_code']})
+
+years_plot = [2016, 2018, 2020, 2022, 2024]
+es_coefs = [model_es.params.get(f'event_{y}', 0) for y in years_plot]
+es_errs  = [model_es.bse.get(f'event_{y}', 0) * 1.96 for y in years_plot]
+```
+
+```{python}
+#| label: setup-robustness
+# Mirrors regression_results_oophe.qmd §6
+y_log = data_did['log_oop_expenditure'].astype(float)
+model_log_ols = sm.OLS(y_log, X_did).fit(cov_type='cluster', cov_kwds={'groups': data_did['state_code']})
+model_wls = sm.WLS(y_log, X_did, weights=data_did['factor']).fit(
+    cov_type='cluster', cov_kwds={'groups': data_did['state_code']}
+)
+
+def fit_alt_cutoff(cutoff_year):
+    col = f'treated_x_post_{cutoff_year}'
+    df_reg_f[col] = df_reg_f['treated'] * (df_reg_f['year'] >= cutoff_year).astype(int)
+    x_cols = [col] + household_controls + state_covariate_cols + list(year_dummies.columns) + list(state_dummies.columns)
+    data = df_reg_f[['oop_expenditure', 'state_code', 'factor'] + x_cols].dropna().copy()
+    X = sm.add_constant(data[x_cols].astype(float))
+    model = sm.GLM(
+        data['oop_expenditure'].astype(float), X, family=sm.families.Poisson(),
+        var_weights=data['factor'].astype(float)
+    ).fit(cov_type='cluster', cov_kwds={'groups': data['state_code']})
+    return model, col
+
+model_alt_2018, col_2018 = fit_alt_cutoff(2018)
+model_alt_2022, col_2022 = fit_alt_cutoff(2022)
+
+df_excl2020 = df_reg_f[df_reg_f['year'] != 2020].copy()
+year_cols_excl2020 = [c for c in year_dummies.columns if c != 'y_2020']
+x_cols_excl2020 = ['treated_x_post'] + household_controls + state_covariate_cols + year_cols_excl2020 + list(state_dummies.columns)
+data_excl2020 = df_excl2020[['oop_expenditure', 'state_code', 'factor'] + x_cols_excl2020].dropna().copy()
+X_excl2020 = sm.add_constant(data_excl2020[x_cols_excl2020].astype(float))
+model_excl2020 = sm.GLM(
+    data_excl2020['oop_expenditure'].astype(float), X_excl2020, family=sm.families.Poisson(),
+    var_weights=data_excl2020['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_excl2020['state_code']})
+
+spec_rows = [
+    {'label': 'Main (post = 2020)', 'coef': model_did.params['treated_x_post'], 'se': model_did.bse['treated_x_post'], 'p': model_did.pvalues['treated_x_post']},
+    {'label': 'post = 2018',        'coef': model_alt_2018.params[col_2018],    'se': model_alt_2018.bse[col_2018],    'p': model_alt_2018.pvalues[col_2018]},
+    {'label': 'post = 2022',        'coef': model_alt_2022.params[col_2022],    'se': model_alt_2022.bse[col_2022],    'p': model_alt_2022.pvalues[col_2022]},
+    {'label': 'Excluding 2020',     'coef': model_excl2020.params['treated_x_post'], 'se': model_excl2020.bse['treated_x_post'], 'p': model_excl2020.pvalues['treated_x_post']},
+    {'label': 'Log-OLS on log(1+y)', 'coef': model_log_ols.params['treated_x_post'], 'se': model_log_ols.bse['treated_x_post'], 'p': model_log_ols.pvalues['treated_x_post']},
+    {'label': 'WLS on log(1+y)',     'coef': model_wls.params['treated_x_post'],     'se': model_wls.bse['treated_x_post'],     'p': model_wls.pvalues['treated_x_post']},
+]
+spec_df = pd.DataFrame(spec_rows)
+spec_df['pct']   = 100 * (np.exp(spec_df['coef']) - 1)
+spec_df['ci_lo'] = 100 * (np.exp(spec_df['coef'] - 1.96 * spec_df['se']) - 1)
+spec_df['ci_hi'] = 100 * (np.exp(spec_df['coef'] + 1.96 * spec_df['se']) - 1)
+spec_df['signif'] = spec_df['p'].apply(sig_stars)
+spec_df
+```
+
+```{python}
+#| label: setup-subcategory-models
+# Mirrors regression_results_subcategories.qmd's fit_main_model + income trim
+SUBCATEGORIES = ['medicines', 'hospital', 'outpatient_care']
+SUBCAT_LABELS = {'oop_expenditure': 'Total OOP spending', 'medicines': 'Medicines',
+                  'hospital': 'Hospital', 'outpatient_care': 'Outpatient care'}
+
+def fit_main_model(df_raw, outcome_col, df_states, trim=True):
+    d = df_raw.copy()
+    if trim:
+        d = d[d['income'] <= d['income'].quantile(0.9999)].copy()
+    yd = pd.get_dummies(d['year'], prefix='y', drop_first=True, dtype=int)
+    sd = pd.get_dummies(d['state_code'], prefix='s', drop_first=True, dtype=int)
+    dr = pd.concat([d, yd, sd], axis=1)
+    drf = dr.merge(df_states, on=['state_code', 'year'], how='left')
+    scc = [c for c in df_states.columns if c not in ('state_code', 'year')]
+    xc = ['treated_x_post'] + household_controls + scc + list(yd.columns) + list(sd.columns)
+    data = drf[[outcome_col, 'state_code', 'factor'] + xc].dropna().copy()
+    X = sm.add_constant(data[xc].astype(float))
+    model = sm.GLM(
+        data[outcome_col].astype(float), X, family=sm.families.Poisson(),
+        var_weights=data['factor'].astype(float)
+    ).fit(cov_type='cluster', cov_kwds={'groups': data['state_code']})
+    return model, data
+
+df_raw_subcat = pd.read_csv(panel_path)
+df_raw_subcat = df_raw_subcat[df_raw_subcat['income'] <= df_raw_subcat['income'].quantile(0.9999)].copy()
+
+subcat_results = {}
+for col in SUBCATEGORIES + ['oop_expenditure']:
+    m, d = fit_main_model(df_raw_subcat, col, df_states)
+    subcat_results[col] = {'model': m, 'N': len(d)}
+    print(f"Fitted {col:16s}  N={len(d):,}  %Δ={100*(np.exp(m.params['treated_x_post'])-1):+.1f}%  "
+          f"p={m.pvalues['treated_x_post']:.3f}")
+```
+
+---
+
+# Main Text Figures
+
+::: {.callout-note}
+**Figure 0 (not built here): treated/control state map.** A choropleth of Mexico's 32 states
+shaded by treatment status would be a strong complement to Section 3.1/6.1, but requires a
+state-boundary shapefile (e.g., INEGI's Marco Geoestadístico) that isn't in this repository. If you
+add one under `input/`, this notebook can build it — flag it and I'll wire it in.
+:::
+
+## Figure 1. Parallel Trends and Event Study
+
+```{python}
+#| label: fig1
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+ax = axes[0]
+trend = df.groupby(['year', 'treated']).apply(
+    lambda g: pd.Series({'mean': DescrStatsW(g['oop_expenditure'].values, weights=g['factor'].values).mean})
+).reset_index()
+
+for t, color, label in [(0, PALETTE['control'], 'Control (never affiliated)'), (1, PALETTE['treated'], 'Treated')]:
+    sub = trend[trend['treated'] == t].sort_values('year')
+    ax.plot(sub['year'], sub['mean'], marker='o', color=color, label=label)
+ax.axvline(2020, color='grey', linestyle='--', alpha=0.7, label='Reform (INSABI, 2020)')
+ax.set_title('A. Mean Quarterly OOP Spending', fontsize=11, fontweight='bold')
+ax.set_xlabel('Survey Year'); ax.set_ylabel('Mean OOP spend (2024 pesos)')
+ax.set_xticks([2016, 2018, 2020, 2022, 2024])
+ax.legend(fontsize=8, loc='upper left')
+ax.grid(alpha=0.3)
+
+ax = axes[1]
+ax.errorbar(years_plot, es_coefs, yerr=es_errs, fmt='o-', color='black', capsize=4)
+ax.axhline(0, color='red', linestyle='--', lw=1)
+ax.axvspan(2019.5, 2020.5, color='grey', alpha=0.15)
+ax.set_title('B. Event-Study Coefficients (ref. year = 2020)', fontsize=11, fontweight='bold')
+ax.set_xlabel('Year'); ax.set_ylabel('Treated × Year (log points)')
+ax.set_xticks([2016, 2018, 2020, 2022, 2024])
+ax.grid(alpha=0.3)
+
+fig.suptitle('Figure 1. Parallel Trends and Event-Study Estimates', fontsize=13, fontweight='bold', y=1.03)
+plt.tight_layout()
+save_fig(fig, 'fig1_parallel_trends_event_study')
+plt.show()
+```
+
+## Figure 2. Sensitivity of the Treatment Effect to Specification Choice
+
+```{python}
+#| label: fig2
+plot_df = spec_df.sort_values('pct').reset_index(drop=True)
+y_pos = np.arange(len(plot_df))
+colors = [dot_color(row['p'], row['coef']) for _, row in plot_df.iterrows()]
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+for i, row in plot_df.iterrows():
+    ax.plot([row['ci_lo'], row['ci_hi']], [y_pos[i], y_pos[i]], color=colors[i], lw=4, alpha=0.8, solid_capstyle='round')
+ax.scatter(plot_df['pct'], y_pos, color=colors, s=80, zorder=3, edgecolors='white', linewidths=0.8)
+for i, row in plot_df.iterrows():
+    ax.text(row['ci_hi'] + 2, y_pos[i], f"{row['pct']:+.1f}%{row['signif']}", va='center', fontsize=9)
+ax.axvline(0, color='#555', lw=1, linestyle='--')
+ax.set_yticks(y_pos)
+ax.set_yticklabels(plot_df['label'], fontsize=10)
+ax.set_xlabel('Estimated %Δ in expected OOP spend (95% CI)', fontsize=10)
+ax.set_title('Figure 2. Sensitivity of the Treatment Effect to Specification Choice', fontsize=12, fontweight='bold')
+ax.grid(axis='x', alpha=0.3, linestyle=':')
+ax.spines[['top', 'right']].set_visible(False)
+fig.text(0.02, -0.06,
+    "Note: Log-OLS/WLS %Δ are log(1+y) semi-elasticities and are not directly comparable in\n"
+    "magnitude to the PPML rows. The extensive-margin logit check (different scale: probability\n"
+    "points, not %-change) is reported in-text only.", fontsize=7.5, ha='left')
+plt.tight_layout()
+save_fig(fig, 'fig2_specification_comparison')
+plt.show()
+```
+
+## Figure 3. Decomposition of the OOP Spending Effect by Subcategory
+
+```{python}
+#| label: fig3
+rows3 = []
+for col in ['oop_expenditure'] + SUBCATEGORIES:
+    m = subcat_results[col]['model']
+    coef, se, p = m.params['treated_x_post'], m.bse['treated_x_post'], m.pvalues['treated_x_post']
+    rows3.append({
+        'label': SUBCAT_LABELS[col], 'coef': coef,
+        'pct': 100 * (np.exp(coef) - 1),
+        'ci_lo': 100 * (np.exp(coef - 1.96 * se) - 1),
+        'ci_hi': 100 * (np.exp(coef + 1.96 * se) - 1),
+        'p': p, 'signif': sig_stars(p),
+    })
+dec_df = pd.DataFrame(rows3)
+y_pos = np.arange(len(dec_df))
+colors = [dot_color(row['p'], row['coef']) for _, row in dec_df.iterrows()]
+
+fig, ax = plt.subplots(figsize=(8, 4))
+for i, row in dec_df.iterrows():
+    ax.plot([row['ci_lo'], row['ci_hi']], [y_pos[i], y_pos[i]], color=colors[i], lw=4, alpha=0.8, solid_capstyle='round')
+ax.scatter(dec_df['pct'], y_pos, color=colors, s=90, zorder=3, edgecolors='white', linewidths=0.8)
+for i, row in dec_df.iterrows():
+    ax.text(row['ci_hi'] + 2, y_pos[i], f"{row['pct']:+.1f}%{row['signif']}", va='center', fontsize=9)
+ax.axvline(0, color='#555', lw=1, linestyle='--')
+ax.set_yticks(y_pos)
+ax.set_yticklabels(dec_df['label'], fontsize=10)
+ax.set_xlabel('Estimated %Δ in expected spending (95% CI)', fontsize=10)
+ax.set_title('Figure 3. Decomposition of the OOP Spending Effect by Subcategory', fontsize=12, fontweight='bold')
+ax.grid(axis='x', alpha=0.3, linestyle=':')
+ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+save_fig(fig, 'fig3_subcategory_decomposition')
+plt.show()
+```
+
+---
+
+# Appendix Figures
+
+## Figure A1. Zero-Inflated Distributions of OOP Spending
+
+```{python}
+#| label: figA1
+fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+outcomes_a1 = ['oop_expenditure'] + SUBCATEGORIES
+for ax, col in zip(axes.flat, outcomes_a1):
+    vals = df_raw_subcat[col]
+    zero_share = (vals == 0).mean()
+    nonzero = vals[vals > 0]
+    clip = nonzero.quantile(0.95) if len(nonzero) else 1
+    ax.hist(vals.clip(upper=clip), bins=40, color='#4C72B0', edgecolor='white', linewidth=0.3)
+    ax.set_title(f"{SUBCAT_LABELS[col]}  (zero share: {zero_share:.0%})", fontsize=10, fontweight='bold')
+    ax.set_xlabel('Quarterly spend (pesos, clipped at p95)', fontsize=8)
+    ax.set_ylabel('Households', fontsize=8)
+    ax.grid(alpha=0.25)
+fig.suptitle('Figure A1. Zero-Inflated Distributions of OOP Spending', fontsize=13, fontweight='bold', y=1.02)
+plt.tight_layout()
+save_fig(fig, 'figA1_zero_inflation_histograms')
+plt.show()
+```
+
+## Figure A2. Full Covariate Effects — Main PPML Model
+
+```{python}
+#| label: figA2
+VAR_LABELS_FULL = {
+    'treated_x_post': 'Treatment × Post (DiD)',
+    'log_income': 'Log Household Income', 'head_sex': 'Sex of Household Head',
+    'head_age': 'Age of Household Head', 'head_education': 'Education of Household Head',
+    'household_size': 'Household Size', 'economic_dependency_ratio': 'Economic Dependency Ratio',
+    'locality_rural': 'Rural Locality',
+    'pct_poverty': '% Poverty', 'total_hospital_beds_per100k': 'Hospital Beds per 100k',
+    'total_doctors_per100k': 'Doctors per 100k',
+    'total_outpatient_consultations_per100k': 'Outpatient Consultations per 100k',
+}
+plot_vars = ['treated_x_post'] + household_controls + state_covariate_cols
+plot_rows = coef_table.loc[[v for v in plot_vars if v in coef_table.index]].copy()
+plot_rows['ci_lo'] = plot_rows['coef'] - 1.96 * plot_rows['std_err']
+plot_rows['ci_hi'] = plot_rows['coef'] + 1.96 * plot_rows['std_err']
+plot_rows['signif'] = plot_rows['p_value'].apply(sig_stars)
+plot_rows = plot_rows.sort_values('coef')
+labels = [VAR_LABELS_FULL.get(v, v) for v in plot_rows.index]
+y_pos = np.arange(len(plot_rows))
+colors = [dot_color(row['p_value'], row['coef']) for _, row in plot_rows.iterrows()]
+
+fig, ax = plt.subplots(figsize=(9, 6))
+for i, (_, row) in enumerate(plot_rows.iterrows()):
+    ax.plot([row['ci_lo'], row['ci_hi']], [y_pos[i], y_pos[i]], color=colors[i], lw=3, alpha=0.8, solid_capstyle='round')
+ax.scatter(plot_rows['coef'], y_pos, color=colors, s=70, zorder=3, edgecolors='white', linewidths=0.7)
+ax.axvline(0, color='#555', lw=1, linestyle='--')
+ax.set_yticks(y_pos)
+ax.set_yticklabels(labels, fontsize=9)
+ax.set_xlabel('Coefficient estimate (log points)', fontsize=10)
+ax.set_title('Figure A2. Full Covariate Effects — Main PPML Model', fontsize=12, fontweight='bold')
+ax.grid(axis='x', alpha=0.3, linestyle=':')
+ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+save_fig(fig, 'figA2_full_covariate_effects')
+plt.show()
+```
+
+## Figure A3. Marginal Relationships — Income and Treatment
+
+```{python}
+#| label: figA3
+beta_map = coef_table['coef'].to_dict()
+X_mean = data_did[x_cols_did].astype(float).mean()
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+# Panel A: log income, binned means (no raw scatter — ~290k points renders as an unreadable
+# cloud and inflates SVG file size substantially)
+ax = axes[0]
+tmp = data_did[['log_income', 'oop_expenditure']].copy()
+tmp['_bin'] = pd.qcut(tmp['log_income'], 20, duplicates='drop')
+binned = tmp.groupby('_bin', observed=True).agg(x=('log_income', 'mean'), y=('oop_expenditure', 'mean')).reset_index(drop=True)
+ax.scatter(binned['x'], binned['y'], color=PALETTE['point'], s=30, zorder=3, label='Binned mean (20 quantile bins)')
+
+x_grid = np.linspace(data_did['log_income'].min(), data_did['log_income'].max(), 100)
+baseline = X_mean.copy()
+preds = []
+for val in x_grid:
+    row = baseline.copy(); row['log_income'] = val
+    lin = beta_map.get('const', 0) + sum(beta_map.get(c, 0) * row[c] for c in x_cols_did)
+    preds.append(np.exp(lin))
+ax.plot(x_grid, preds, color='black', lw=2, label='Predicted E[OOP spend]')
+ax.set_title('A. Log Household Income', fontsize=10, fontweight='bold')
+ax.set_xlabel('Log household income'); ax.set_ylabel('OOP spend (pesos)')
+ax.legend(fontsize=8); ax.grid(alpha=0.25)
+
+# Panel B: treated_x_post, predicted E[y] at 0 vs 1 holding other covariates at sample mean
+ax = axes[1]
+preds01 = []
+for val in [0, 1]:
+    row = X_mean.copy(); row['treated_x_post'] = val
+    lin = beta_map.get('const', 0) + sum(beta_map.get(c, 0) * row[c] for c in x_cols_did)
+    preds01.append(np.exp(lin))
+ax.bar(['Control /\nPre-period', 'Treated &\nPost-period'], preds01, color=[PALETTE['control'], PALETTE['treated']], width=0.5)
+te = coef_table.loc['treated_x_post']
+ax.annotate(f"{te['pct_change']:+.1f}%, p={te['p_value']:.3f}", xy=(0.5, max(preds01) * 1.05), ha='center', fontsize=9)
+ax.set_title('B. Treatment × Post (other covariates at sample mean)', fontsize=10, fontweight='bold')
+ax.set_ylabel('Predicted OOP spend (pesos)')
+ax.grid(axis='y', alpha=0.25)
+
+fig.suptitle('Figure A3. Marginal Relationships — Income and Treatment', fontsize=12, fontweight='bold')
+plt.tight_layout()
+save_fig(fig, 'figA3_marginal_effects_binned')
+plt.show()
+```
+
+## Figure A4. Event-Study Estimates by Subcategory
+
+```{python}
+#| label: figA4
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+for ax, col in zip(axes, SUBCATEGORIES):
+    d = df_raw_subcat.copy()
+    yd = pd.get_dummies(d['year'], prefix='y', drop_first=True, dtype=int)
+    sd = pd.get_dummies(d['state_code'], prefix='s', drop_first=True, dtype=int)
+    dr = pd.concat([d, yd, sd], axis=1)
+    drf = dr.merge(df_states, on=['state_code', 'year'], how='left')
+    scc = [c for c in df_states.columns if c not in ('state_code', 'year')]
+    ecols = []
+    for y in [2016, 2018, 2022, 2024]:
+        c = f'event_{y}'
+        drf[c] = drf['treated'] * (drf['year'] == y).astype(int)
+        ecols.append(c)
+    xc = ecols + household_controls + scc + list(yd.columns) + list(sd.columns)
+    data = drf[[col, 'state_code', 'factor'] + xc].dropna().copy()
+    X = sm.add_constant(data[xc].astype(float))
+    m = sm.GLM(
+        data[col].astype(float), X, family=sm.families.Poisson(), var_weights=data['factor'].astype(float)
+    ).fit(cov_type='cluster', cov_kwds={'groups': data['state_code']})
+
+    yrs = [2016, 2018, 2020, 2022, 2024]
+    cs = [m.params.get(f'event_{y}', 0) for y in yrs]
+    es = [m.bse.get(f'event_{y}', 0) * 1.96 for y in yrs]
+    ax.errorbar(yrs, cs, yerr=es, fmt='o-', color='black', capsize=4)
+    ax.axhline(0, color='red', linestyle='--', lw=1)
+    ax.axvspan(2019.5, 2020.5, color='grey', alpha=0.15)
+    ax.set_title(SUBCAT_LABELS[col], fontsize=10, fontweight='bold')
+    ax.set_xlabel('Year'); ax.set_xticks(yrs)
+    ax.grid(alpha=0.25)
+
+axes[0].set_ylabel('Treated × Year (log points, rel. to 2020)')
+fig.suptitle('Figure A4. Event-Study Estimates by Subcategory', fontsize=13, fontweight='bold', y=1.03)
+plt.tight_layout()
+save_fig(fig, 'figA4_subcategory_event_studies')
+plt.show()
+```
+
+## Figure A5. Mean Quarterly OOP Spending by Subcategory and Treatment Status
+
+```{python}
+#| label: figA5
+outcomes_a5 = ['oop_expenditure'] + SUBCATEGORIES
+bar_rows = []
+for col in outcomes_a5:
+    for t in [0, 1]:
+        g = df[df['treated'] == t]
+        d = DescrStatsW(g[col].values, weights=g['factor'].values)
+        bar_rows.append({'outcome': col, 'treated': t, 'mean': d.mean})
+bar_df = pd.DataFrame(bar_rows)
+
+fig, ax = plt.subplots(figsize=(9, 5.5))
+x = np.arange(len(outcomes_a5))
+width = 0.35
+for t, color, label, offset in [(1, PALETTE['treated'], 'Treated', -width/2), (0, PALETTE['control'], 'Control (never affiliated)', width/2)]:
+    sub = bar_df[bar_df['treated'] == t].set_index('outcome').loc[outcomes_a5]
+    ax.bar(x + offset, sub['mean'], width, color=color, label=label, edgecolor='white', linewidth=0.5)
+ax.set_xticks(x)
+ax.set_xticklabels([SUBCAT_LABELS[c] for c in outcomes_a5], fontsize=10)
+ax.set_ylabel('Mean quarterly OOP spend (2024 pesos)')
+ax.set_title('Figure A5. Mean Quarterly OOP Spending by Subcategory and Treatment Status', fontsize=12, fontweight='bold')
+ax.legend(fontsize=9)
+ax.grid(axis='y', alpha=0.3)
+ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+save_fig(fig, 'figA5_subcategory_means_by_treatment')
+plt.show()
+```

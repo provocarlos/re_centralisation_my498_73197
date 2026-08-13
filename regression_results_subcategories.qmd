@@ -1,0 +1,223 @@
+---
+title: Decomposing Out-of-Pocket Health Spending — Medicines, Hospital, and Ambulatory Care
+author: Carlos Mora
+date: '2026-05-18'
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+jupyter: python3
+---
+
+::: {.callout-note}
+`regression_results_oophe.qmd` estimates the effect of IMSS-Bienestar affiliation on total
+out-of-pocket (OOP) health spending using survey-weighted PPML. This notebook applies that same
+main model separately to the three spending subcategories that make up total OOP spending:
+**`medicines`**, **`hospital`** (hospitalization), and **`outpatient_care`** (ambulatory/outpatient
+visits) — to see which subcategory is driving the aggregate effect.
+
+`oop_expenditure = outpatient_care + hospital + medicines` exactly (verified below), so these
+three models decompose the same total spending increase into its parts — though %-changes on the
+parts do not sum to the %-change on the total, since percentages are relative to each
+subcategory's own (very different) baseline mean.
+:::
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Load the data ────────────────────────────────────────────────────────────
+panel_path  = Path("resultados/access_analysis_panel.csv")
+states_path = Path("resultados/state_covariates.csv")
+df_raw      = pd.read_csv(panel_path)
+df_states   = pd.read_csv(states_path)
+
+SUBCATEGORIES = ['medicines', 'hospital', 'outpatient_care']
+
+df_raw = df_raw[df_raw['income'] <= df_raw['income'].quantile(0.9999)].copy()
+
+
+# Verify the decomposition identity referenced above
+resid = (df_raw[SUBCATEGORIES].sum(axis=1) - df_raw['oop_expenditure']).abs()
+print(f"max |sum(subcategories) - oop_expenditure| = {resid.max():.2e}  (should be ~0)")
+```
+
+## 1. Descriptive Statistics
+
+Each subcategory has a very different zero-share — `hospital` in particular is dominated by
+zeros, since hospitalization in a given quarter is a rare event even though it's expensive when
+it happens. This is the same zero-inflation territory `oop_expenditure` is in (only more extreme),
+which is why the main model here is survey-weighted PPML rather than a log transform.
+
+```{python}
+#| label: tbl-zero-share
+for col in SUBCATEGORIES + ['oop_expenditure']:
+    print(f"{col:16s}  zero share: {(df_raw[col] == 0).mean():5.1%}   "
+          f"mean: {df_raw[col].mean():8.1f}   p99: {df_raw[col].quantile(0.99):9.1f}")
+```
+
+```{python}
+#| label: fig-parallel-trends-subcats
+
+plt.style.use('seaborn-v0_8-whitegrid')
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharex=True)
+for ax, col in zip(axes, SUBCATEGORIES):
+    sns.lineplot(data=df_raw, x='year', y=col, hue='treated', marker='o', ax=ax, legend=(col == 'medicines'))
+    ax.axvline(x=2020, color='red', linestyle='--', alpha=0.6)
+    ax.axvline(x=2022, color='orange', linestyle='--', alpha=0.6)
+    ax.set_title(col)
+    ax.set_xlabel("Survey Year")
+    ax.set_ylabel("Mean quarterly spend (pesos)" if col == 'medicines' else '')
+    ax.grid(True, alpha=0.3)
+plt.suptitle("Mean Quarterly OOP Spending by Subcategory and Treatment Status", y=1.02)
+plt.tight_layout()
+plt.savefig('resultados/figures/fig_parallel_trends_subcategories.svg', bbox_inches='tight')
+plt.savefig('resultados/figures/fig_parallel_trends_subcategories.pdf', bbox_inches='tight')
+plt.show()
+```
+
+::: {.callout-note}
+**Treatment timing.** Most states' IMSS-Bienestar affiliation was adopted between 2020 and 2021.
+ENIGH survey waves are biannual, so `post = year >= 2020` places the whole adoption window at or
+after the first post-period wave. A single common `post = 2020` cutoff is used throughout this
+notebook, consistent with the companion `oophe` notebook's main specification.
+:::
+
+## 2. Main Model, Applied per Subcategory
+
+```{python}
+#| label: fit-subcategory-models
+household_controls = [
+    'log_income', 'head_sex', 'head_age', 'head_education',
+    'household_size', 'economic_dependency_ratio', 'locality_rural'
+]
+
+def fit_main_model(df_raw, outcome_col, df_states, trim=True):
+    """Replicates the main specification from regression_results_oophe.qmd §5: state+year FE,
+    survey-weighted PPML on the raw outcome, cluster-robust SE by state."""
+    df = df_raw.copy()
+    if trim:
+        df = df[df['income'] <= df['income'].quantile(0.9999)].copy()
+
+    year_dummies  = pd.get_dummies(df['year'],       prefix='y', drop_first=True, dtype=int)
+    state_dummies = pd.get_dummies(df['state_code'], prefix='s', drop_first=True, dtype=int)
+    df_reg = pd.concat([df, year_dummies, state_dummies], axis=1)
+
+    df_reg_f = df_reg.merge(df_states, on=['state_code', 'year'], how='left')
+    state_covariate_cols = [c for c in df_states.columns if c not in ('state_code', 'year')]
+
+    x_cols = (
+        ['treated_x_post'] + household_controls + state_covariate_cols
+        + list(year_dummies.columns) + list(state_dummies.columns)
+    )
+    data = df_reg_f[[outcome_col, 'state_code', 'factor'] + x_cols].dropna().copy()
+    X = sm.add_constant(data[x_cols].astype(float))
+
+    model = sm.GLM(
+        data[outcome_col].astype(float), X, family=sm.families.Poisson(),
+        var_weights=data['factor'].astype(float)
+    ).fit(cov_type='cluster', cov_kwds={'groups': data['state_code']})
+
+    return model, data
+
+def sig_stars(p):
+    if pd.isna(p): return ''
+    if p < 0.01:   return '***'
+    if p < 0.05:   return '**'
+    if p < 0.10:   return '*'
+    return ''
+
+results = {}
+pre_control = df_raw[(df_raw['treated'] == 0) & (df_raw['year'] < 2020)]
+for col in SUBCATEGORIES + ['oop_expenditure']:
+    model, data = fit_main_model(df_raw, col, df_states)
+    results[col] = {
+        'model': model, 'N': len(data), 'zero_share': (df_raw[col] == 0).mean(),
+        # Survey-weighted, consistent with @tbl-descriptives and every other descriptive
+        # statistic in the thesis — a plain .mean() here would silently mix weighting
+        # conventions within the same document.
+        'mean_control_pre': np.average(pre_control[col], weights=pre_control['factor']),
+    }
+    print(f"Fitted: {col:16s}  N = {len(data):,}")
+```
+
+::: {.callout-note}
+`oop_expenditure` is refit here (not just quoted from the companion notebook) so the comparison
+table below is fully self-contained and directly reproducible from this file alone.
+:::
+
+## 3. Combined Comparison
+
+```{python}
+#| label: tbl-combined-comparison
+rows = []
+for col in SUBCATEGORIES + ['oop_expenditure']:
+    m = results[col]['model']
+    coef, se, p = m.params['treated_x_post'], m.bse['treated_x_post'], m.pvalues['treated_x_post']
+    pct = 100 * (np.exp(coef) - 1)
+    ci_lo_pct = 100 * (np.exp(coef - 1.96 * se) - 1)
+    ci_hi_pct = 100 * (np.exp(coef + 1.96 * se) - 1)
+    rows.append({
+        'Outcome': col,
+        'Coef.': coef, 'SE': se, 'p-value': p, 'signif': sig_stars(p),
+        '%Δ': pct, '95% CI lo': ci_lo_pct, '95% CI hi': ci_hi_pct,
+        'N': results[col]['N'], 'Zero share': results[col]['zero_share'],
+        'Control-group pre-period mean (pesos)': results[col]['mean_control_pre'],
+    })
+
+comparison = pd.DataFrame(rows).set_index('Outcome')
+comparison
+```
+
+## 4. Interpretation
+
+```{python}
+#| label: print-summary
+for col in SUBCATEGORIES + ['oop_expenditure']:
+    row = comparison.loc[col]
+    print(f"{col:16s}  {row['%Δ']:+6.1f}%  (95% CI {row['95% CI lo']:+.1f}% to {row['95% CI hi']:+.1f}%)  "
+          f"p={row['p-value']:.3f} {row['signif']:3s}  zero-share={row['Zero share']:.0%}  N={row['N']:,}")
+```
+
+Reading the decomposition, using the actual fitted numbers (top 0.01% of household incomes
+excluded, consistent with the companion `oophe` notebook). `Control pre-mean` is the
+survey-weighted mean among control-group households in the pre-2020 waves, consistent with the
+weighting convention used everywhere else in this project (`Zero share` is the one exception,
+reported unweighted on the full estimation sample):
+
+| Outcome | %Δ | 95% CI | p-value | Zero share | Control pre-mean (pesos) |
+|---|---|---|---|---|---|
+| medicines | +47.5% | +9.7% to +98.2% | 0.010 ** | 59% | 193 |
+| hospital | +37.9% | -1.4% to +93.0% | 0.061 * | 97% | 220 |
+| outpatient_care | +16.6% | +2.4% to +32.6% | 0.020 ** | 61% | 875 |
+| **oop_expenditure (total)** | **+23.3%** | +9.1% to +39.4% | **0.001** *** | 39% | 1,287 |
+
+1. **All three subcategories now clear at least the 10% significance threshold, with
+   `medicines` and `outpatient_care` significant at 5%** (p=0.010 and p=0.020) and `hospital`
+   marginal (p=0.061). Unlike under the narrower 6-state control group, the effect is no longer
+   concentrated in a single category: `medicines` has both the largest point estimate (+47.5%) and
+   the tightest evidence of the two smaller categories, while `outpatient_care` remains the most
+   precisely estimated in relative terms (narrowest CI) and, by far, the largest in absolute peso
+   terms — its control-group baseline (875 pesos/quarter) is roughly 4x medicines' (193) and
+   hospital's (220). A back-of-envelope calculation (baseline mean × %Δ) gives ≈92 pesos for
+   medicines, ≈83 pesos for hospital, and ≈145 pesos for outpatient_care — summing to ≈320 pesos,
+   somewhat above the total model's own implied ≈300-peso increase (1,287 × 23.3%); the gap is a
+   reminder that these are approximate, since summing three separately-fit, nonlinear (log-link)
+   Poisson means need not reconcile exactly with the total's own fit.
+2. **`hospital` remains the least precisely estimated of the three** (95% CI spans −1.4% to
+   +93.0%, only barely including zero) — expected, given its ~97% zero-share leaves very little
+   quarter-to-quarter variation to estimate off, regardless of the true effect.
+3. **Bottom line**: unlike the earlier, narrower control group — where only `outpatient_care`
+   reached significance — the aggregate increase in OOP spending now shows up as broadly
+   distributed across all three subcategories, with `medicines` and `outpatient_care` individually
+   significant and `hospital` close behind. As in the companion `oophe` notebook, this uses
+   `post = year >= 2020` as the primary cutoff — see that notebook's §6 for how sensitive the total
+   effect is to that choice; the same caveat applies to each subcategory here.

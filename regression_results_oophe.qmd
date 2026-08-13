@@ -1,0 +1,554 @@
+---
+title: Impact of IMSS-Bienestar Affiliation on Out-of-Pocket Health Expenditure in Mexico
+author: Carlos Mora
+date: '2026-05-18'
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+jupyter: python3
+---
+
+::: {.callout-note}
+This notebook estimates the effect of IMSS-Bienestar affiliation on quarterly household
+out-of-pocket (OOP) health expenditure, using a two-way fixed-effects difference-in-differences
+design (state + year FE, cluster-robust SE by state). The control group is the 8 states that never
+affiliated with IMSS-Bienestar (Aguascalientes, Coahuila, Chihuahua, Durango, Guanajuato, Jalisco,
+Nuevo León, Querétaro); the treated group is the other 24.
+
+**Main specification: survey-weighted PPML** (Poisson pseudo-maximum-likelihood on the raw peso
+amount, weighted by the ENIGH expansion factor). ~39% of households report zero quarterly OOP
+spending, and PPML handles that zero mass natively — unlike `log(1 + y)`, which gives
+semi-elasticities that aren't invariant to the added constant (Chen & Roth 2024; Bellemare &
+Wichman 2020) and, as §6 shows, materially overstates the effect here. Log-OLS and WLS are
+reported in §6 as secondary comparisons.
+:::
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from pathlib import Path
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Load the data ────────────────────────────────────────────────────────────
+panel_path  = Path("resultados/access_analysis_panel.csv")
+states_path = Path("resultados/state_covariates.csv")
+df          = pd.read_csv(panel_path)
+df_states   = pd.read_csv(states_path)
+
+# Trim the top 0.01% of household incomes (a handful of extreme earners otherwise dominate the
+# PPML likelihood and the income coefficient)
+df = df[df['income'] <= df['income'].quantile(0.9999)].copy()
+```
+
+## 1. Descriptive Statistics
+
+```{python}
+#| label: tbl-stats
+summary_stats = df.groupby(['year', 'treated']).agg({
+    'oop_expenditure':  ['mean', 'std'],
+    'log_oop_expenditure':  'mean',
+    'public_attention': 'mean',
+}).reset_index()
+summary_stats
+```
+
+```{python}
+#| label: tbl-zero-share
+print(f"Share of households with zero quarterly OOP health spending: {(df['oop_expenditure'] == 0).mean():.1%}")
+```
+
+## 2. Parallel Trends and Treatment Timing
+
+```{python}
+#| label: fig-parallel-trends-oophe
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.figure(figsize=(10, 6))
+sns.lineplot(data=df, x='year', y='oop_expenditure', hue='treated', marker='o')
+plt.axvline(x=2020, color='red', linestyle='--', label='INSABI (federal predecessor)')
+plt.axvline(x=2022, color='orange', linestyle='--', label='IMSS-Bienestar rollout')
+plt.title("Mean Quarterly Out-of-Pocket Health Expenditure (Survey Year)")
+plt.xlabel("Survey Year")
+plt.ylabel("Mean OOP Health Expenditure (constant 2024 pesos)")
+plt.legend(title="Treated (IMSS-B)")
+plt.grid(True, alpha=0.3)
+plt.savefig('resultados/figures/fig_parallel_trends_oophe.svg', bbox_inches='tight')
+plt.savefig('resultados/figures/fig_parallel_trends_oophe.pdf', bbox_inches='tight')
+plt.show()
+```
+
+::: {.callout-note}
+**Treatment timing.** Most states' IMSS-Bienestar affiliation was adopted between 2020 and 2021,
+replacing Seguro Popular/INSABI. ENIGH survey waves are biannual (2016, 2018, 2020, 2022, 2024),
+so `post = year >= 2020` places the entire adoption window at or after the first post-period wave
+— 2018 is unambiguously pre-treatment and 2022/2024 are unambiguously post-treatment, with 2020
+itself sitting right at the boundary. §6 checks robustness to this by also estimating with
+`post = year >= 2018` and `post = year >= 2022`, and by dropping 2020 entirely.
+:::
+
+## 3. Data Preparation
+
+```{python}
+#| label: prep-regressors
+year_dummies  = pd.get_dummies(df['year'],       prefix='y', drop_first=True, dtype=int)
+state_dummies = pd.get_dummies(df['state_code'], prefix='s', drop_first=True, dtype=int)
+df_reg = pd.concat([df, year_dummies, state_dummies], axis=1)
+
+# Household covariates that are plausibly pre-determined relative to OOP spending
+household_controls = [
+    'log_income', 'head_sex', 'head_age', 'head_education',
+    'household_size', 'economic_dependency_ratio', 'locality_rural'
+]
+
+# Household panel is the base unit; state covariates attach to it via a left join
+df_reg_f = df_reg.merge(df_states, on=['state_code', 'year'], how='left')
+
+state_covariate_cols = [c for c in df_states.columns if c not in ('state_code', 'year')]
+
+print(f"Household controls: {household_controls}")
+print(f"State covariates:   {state_covariate_cols}")
+```
+
+::: {.callout-note}
+`treated`, raw `year`, and `post_treatment` are excluded from the regressors: state and year fixed
+effects absorb those main effects in a standard two-way fixed-effects design, so only
+`treated_x_post` is needed to identify the DiD effect. `public_attention` (choice of provider) is
+also excluded — it is jointly determined with OOP spending, the same decision made at the same
+time, so including it would be a bad control.
+:::
+
+## 4. Event Study
+
+```{python}
+#| label: fig-event-study
+event_cols = []
+for y in [2016, 2018, 2022, 2024]:
+    col = f'event_{y}'
+    df_reg_f[col] = df_reg_f['treated'] * (df_reg_f['year'] == y).astype(int)
+    event_cols.append(col)
+
+x_cols_es = event_cols + household_controls + state_covariate_cols + list(year_dummies.columns) + list(state_dummies.columns)
+
+data_es = df_reg_f[['oop_expenditure', 'state_code', 'factor'] + x_cols_es].dropna().copy()
+X_es = sm.add_constant(data_es[x_cols_es].astype(float))
+
+model_es = sm.GLM(
+    data_es['oop_expenditure'].astype(float), X_es, family=sm.families.Poisson(),
+    var_weights=data_es['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_es['state_code']})
+
+years_plot = [2016, 2018, 2020, 2022, 2024]
+coefs = [model_es.params.get(f'event_{y}', 0) for y in years_plot]
+errs  = [model_es.bse.get(f'event_{y}', 0) * 1.96 for y in years_plot]
+
+plt.figure(figsize=(10, 6))
+plt.errorbar(years_plot, coefs, yerr=errs, fmt='o-', color='black', capsize=5)
+plt.axhline(y=0, color='red', linestyle='--')
+plt.title("Event Study: Effect on OOP Health Expenditure (Survey-Weighted PPML)\n(state + year FE, SE clustered by state)")
+plt.xlabel("Year")
+plt.ylabel("Estimated effect on log E[OOP spend] (relative to 2020)")
+plt.savefig('resultados/figures/fig_event_study_oophe.svg', bbox_inches='tight')
+plt.savefig('resultados/figures/fig_event_study_oophe.pdf', bbox_inches='tight')
+plt.show()
+
+print(model_es.summary().tables[1])
+```
+
+## 5. Main Model — Two-Way Fixed-Effects PPML
+
+```{python}
+#| label: model-did
+x_cols_did = (
+    ['treated_x_post'] + household_controls + state_covariate_cols
+    + list(year_dummies.columns) + list(state_dummies.columns)
+)
+
+data_did = df_reg_f[['log_oop_expenditure', 'oop_expenditure', 'state_code', 'factor'] + x_cols_did].dropna().copy()
+X_did = sm.add_constant(data_did[x_cols_did].astype(float))
+
+print(f"N = {len(data_did):,}")
+print(f"Clusters (states): {data_did['state_code'].nunique()}")
+
+model_did = sm.GLM(
+    data_did['oop_expenditure'].astype(float), X_did, family=sm.families.Poisson(),
+    var_weights=data_did['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_did['state_code']})
+
+def sig_stars(p):
+    if pd.isna(p): return ''
+    if p < 0.01:   return '***'
+    if p < 0.05:   return '**'
+    if p < 0.10:   return '*'
+    return ''
+
+coef_table = pd.DataFrame({
+    'coef':    model_did.params,
+    'std_err': model_did.bse,
+    't_stat':  model_did.tvalues,
+    'p_value': model_did.pvalues,
+})
+coef_table['signif'] = coef_table['p_value'].apply(sig_stars)
+coef_table['pct_change'] = 100 * (np.exp(coef_table['coef']) - 1)
+
+print("=" * 70)
+print("  KEY COEFFICIENTS  (survey-weighted PPML, outcome = oop_expenditure)")
+print("=" * 70)
+print(coef_table.loc[['treated_x_post'] + household_controls + state_covariate_cols,
+    ['coef', 'std_err', 'p_value', 'signif', 'pct_change']
+    ].to_string(float_format='{:.4f}'.format))
+print()
+print("pct_change = 100*(exp(coef)-1): the implied % change in expected OOP spend for a")
+print("one-unit change in the regressor. For treated_x_post, this is the DiD effect.")
+
+te = coef_table.loc['treated_x_post']
+ci_lo, ci_hi = te['coef'] - 1.96 * te['std_err'], te['coef'] + 1.96 * te['std_err']
+print()
+print(f"Treated x Post: {te['pct_change']:+.1f}% change in expected OOP spend "
+      f"(95% CI: {100*(np.exp(ci_lo)-1):+.1f}% to {100*(np.exp(ci_hi)-1):+.1f}%, p={te['p_value']:.3f})")
+```
+
+::: {.callout-warning}
+**Cluster-robust SE with few clusters.** There are only 32 state clusters (24 treated / 8
+control); treat asymptotic cluster-robust SEs as a first pass, and consider a wild cluster
+bootstrap for the final paper.
+:::
+
+## 6. Robustness Checks
+
+```{python}
+#| label: robustness-table
+# Log-OLS on log(1 + oop_expenditure) — the traditional approach
+y_log = data_did['log_oop_expenditure'].astype(float)
+model_log_ols = sm.OLS(y_log, X_did).fit(cov_type='cluster', cov_kwds={'groups': data_did['state_code']})
+
+# Survey-weighted WLS on log(1 + oop_expenditure)
+model_wls = sm.WLS(y_log, X_did, weights=data_did['factor']).fit(
+    cov_type='cluster', cov_kwds={'groups': data_did['state_code']}
+)
+
+# Extensive margin: logit on whether the household had ANY OOP spending at all
+data_did['any_oop'] = (data_did['oop_expenditure'] > 0).astype(int)
+model_logit = sm.Logit(data_did['any_oop'].astype(float), X_did).fit(
+    cov_type='cluster', cov_kwds={'groups': data_did['state_code']}, disp=0
+)
+ame_logit = model_logit.get_margeff(at='overall').summary_frame().loc['treated_x_post']
+
+def fit_alt_cutoff(cutoff_year):
+    """Weighted PPML with post = year >= cutoff_year instead of 2020. Needs its own design
+    matrix, since the treated_x_post column and its position in x_cols differ from the main
+    model's."""
+    col = f'treated_x_post_{cutoff_year}'
+    df_reg_f[col] = df_reg_f['treated'] * (df_reg_f['year'] >= cutoff_year).astype(int)
+    x_cols = [col] + household_controls + state_covariate_cols + list(year_dummies.columns) + list(state_dummies.columns)
+    data = df_reg_f[['oop_expenditure', 'state_code', 'factor'] + x_cols].dropna().copy()
+    X = sm.add_constant(data[x_cols].astype(float))
+    model = sm.GLM(
+        data['oop_expenditure'].astype(float), X, family=sm.families.Poisson(),
+        var_weights=data['factor'].astype(float)
+    ).fit(cov_type='cluster', cov_kwds={'groups': data['state_code']})
+    return model, col
+
+model_alt_2018, col_2018 = fit_alt_cutoff(2018)
+model_alt_2022, col_2022 = fit_alt_cutoff(2022)
+
+# Excluding 2020 entirely — 2020 is the year IMSS-Bienestar adoption was actually rolling out
+# across states, so it's the least clean "post" observation under a single common cutoff.
+# Dropping it and re-estimating with only 2016/2018 (pre) vs. 2022/2024 (post) checks whether
+# that one ambiguous year is doing the work. The y_2020 dummy is dropped too, since it would be
+# identically zero (and uninformative) once every 2020 row is removed.
+df_excl2020 = df_reg_f[df_reg_f['year'] != 2020].copy()
+year_cols_excl2020 = [c for c in year_dummies.columns if c != 'y_2020']
+x_cols_excl2020 = ['treated_x_post'] + household_controls + state_covariate_cols + year_cols_excl2020 + list(state_dummies.columns)
+data_excl2020 = df_excl2020[['oop_expenditure', 'state_code', 'factor'] + x_cols_excl2020].dropna().copy()
+X_excl2020 = sm.add_constant(data_excl2020[x_cols_excl2020].astype(float))
+model_excl2020 = sm.GLM(
+    data_excl2020['oop_expenditure'].astype(float), X_excl2020, family=sm.families.Poisson(),
+    var_weights=data_excl2020['factor'].astype(float)
+).fit(cov_type='cluster', cov_kwds={'groups': data_excl2020['state_code']})
+
+robustness = pd.DataFrame([
+    {'Specification': 'Main: PPML, survey-weighted (post = 2020)',
+     'Coef.': model_did.params['treated_x_post'], 'SE': model_did.bse['treated_x_post'],
+     'p-value': model_did.pvalues['treated_x_post'], 'N': int(model_did.nobs)},
+    {'Specification': 'Log-OLS on log(1 + oop_expenditure)',
+     'Coef.': model_log_ols.params['treated_x_post'], 'SE': model_log_ols.bse['treated_x_post'],
+     'p-value': model_log_ols.pvalues['treated_x_post'], 'N': int(model_log_ols.nobs)},
+    {'Specification': 'WLS on log(1 + oop_expenditure), survey weights',
+     'Coef.': model_wls.params['treated_x_post'], 'SE': model_wls.bse['treated_x_post'],
+     'p-value': model_wls.pvalues['treated_x_post'], 'N': int(model_wls.nobs)},
+    {'Specification': 'Extensive margin: P(any OOP spending), logit AME',
+     'Coef.': ame_logit['dy/dx'], 'SE': ame_logit['Std. Err.'],
+     'p-value': ame_logit['Pr(>|z|)'], 'N': int(model_logit.nobs)},
+    {'Specification': 'PPML, survey-weighted, post = 2018',
+     'Coef.': model_alt_2018.params[col_2018], 'SE': model_alt_2018.bse[col_2018],
+     'p-value': model_alt_2018.pvalues[col_2018], 'N': int(model_alt_2018.nobs)},
+    {'Specification': 'PPML, survey-weighted, post = 2022',
+     'Coef.': model_alt_2022.params[col_2022], 'SE': model_alt_2022.bse[col_2022],
+     'p-value': model_alt_2022.pvalues[col_2022], 'N': int(model_alt_2022.nobs)},
+    {'Specification': 'PPML, survey-weighted, excluding 2020 entirely',
+     'Coef.': model_excl2020.params['treated_x_post'], 'SE': model_excl2020.bse['treated_x_post'],
+     'p-value': model_excl2020.pvalues['treated_x_post'], 'N': int(model_excl2020.nobs)},
+])
+robustness['signif'] = robustness['p-value'].apply(sig_stars)
+robustness['pct_change'] = 100 * (np.exp(robustness['Coef.']) - 1)
+# The logit row's "Coef." is an average marginal effect on P(any spending), in probability points
+# — not a log-coefficient, so exponentiating it wouldn't represent a %-change.
+robustness.loc[robustness['Specification'].str.contains('logit'), 'pct_change'] = np.nan
+robustness
+```
+
+### Interpretation
+
+**The main model finds a +23.0% increase in expected out-of-pocket spending** (95% CI: +8.7% to
++39.2%, p=0.001). The seven-row comparison above:
+
+| Specification | %Δ | p-value | Significant? |
+|---|---|---|---|
+| **Main: PPML, survey-weighted (post = 2020)** | **+23.0%** | **0.001** | **Yes** |
+| Log-OLS on log(1+y) | +28.8%¹ | 0.045 | Yes |
+| WLS on log(1+y), weighted | +50.6%¹ | 0.027 | Yes |
+| Extensive margin: logit AME | +4.1 pp² | 0.036 | Yes |
+| PPML, weighted, post = 2018 | +25.7% | 0.003 | Yes |
+| PPML, weighted, post = 2022 | +4.1% | 0.419 | No |
+| PPML, weighted, excluding 2020 | +17.0% | 0.027 | Yes |
+
+¹ log-scale semi-elasticities on `log(1+y)`, not directly comparable in magnitude to PPML's %Δ on
+the natural scale. ² percentage-point change in the probability of *any* OOP spending, not a
+%-change in the amount.
+
+**The result is sensitive to how the 2020 survey wave is classified, though this 8-state control
+group is markedly more robust to that choice than a narrower one.** Moving the cutoff earlier
+(`post = 2018`, which reclassifies nothing about 2020 itself but changes the pre-period to a
+single year) *strengthens* the effect to +25.7% (p=0.003). Moving it later (`post = 2022`, which
+reclassifies 2020 as pre-treatment) all but eliminates it: +4.1%, p=0.419 — the one specification
+under which the effect is not detectable. Dropping 2020 from the sample entirely now yields a
+result that remains significant: +17.0% (p=0.027) — unlike under a narrower control group, this
+check no longer loses significance once 2020 is set aside.
+
+This pattern is exactly what you'd expect if IMSS-Bienestar affiliation was genuinely still rolling
+out through 2020-2021 (per §2): the 2020 ENIGH wave likely captured a mix of already-affiliated and
+not-yet-affiliated treated states. Whether that wave is coded "post" (as in the main model) or
+"pre" (as in the `post = 2022` check) materially changes the answer, because it is the one wave
+where the coding is genuinely ambiguous rather than a matter of estimator choice. The log-based
+checks (log-OLS, WLS) agree in direction and, under this control group, both clear conventional
+significance in their own right, as does the extensive-margin logit check.
+
+**My read: there is a positive point estimate under every specification, and statistical
+confidence now extends to five of the seven checks, not just the two that treat 2020 as "post" —
+this is a real and comparatively robust finding, though still not fully settled.** `post = 2022` is
+the one specification that fails to detect an effect; I would still report it alongside the
+headline number rather than omit it, since it is the cleanest test of whether coding 2020 as
+"post" is doing the work. The honest summary is "OOP spending appears to have risen after
+affiliation, robust to most but not all ways of handling the ambiguous 2020 transition wave."
+
+## 7. Marginal Effect Plots
+
+Each panel shows the **partial relationship** between one predictor and predicted OOP spending,
+holding all other predictors at their sample mean, using the main model (§5). Since PPML is a
+log-link model, predictions are computed on the log scale and exponentiated back to pesos.
+
+```{python}
+#| label: fig-marginal-plots
+
+MARGINAL_VARS = [
+    'treated_x_post',
+    'log_income',
+    'head_sex',
+    'pct_poverty',
+    'total_hospital_beds_per100k',
+    'total_doctors_per100k',
+]
+
+VAR_LABELS = {
+    'treated_x_post':                'Treatment × Post (DiD)',
+    'log_income':                    'Log Household Income',
+    'head_sex':                      'Sex of Household Head',
+    'pct_poverty':                   '% Poverty',
+    'total_hospital_beds_per100k':   'Total Hospital Beds per 100k',
+    'total_doctors_per100k':         'Total Doctors per 100k',
+}
+
+X_mean = data_did[x_cols_did].astype(float).mean()
+beta_map = coef_table['coef'].to_dict()
+
+def marginal_prediction(var, grid_points=200):
+    if var not in x_cols_did:
+        return None
+    var_vals = data_did[var].astype(float)
+    x_grid = np.linspace(var_vals.min(), var_vals.max(), grid_points)
+
+    baseline = X_mean.copy()
+    eta = []
+    for val in x_grid:
+        row = baseline.copy()
+        row[var] = val
+        lin = beta_map.get('const', 0) + sum(beta_map.get(c, 0) * row[c] for c in x_cols_did)
+        eta.append(lin)
+    eta = np.array(eta)
+
+    se = coef_table.loc[var, 'std_err'] if var in coef_table.index else 0
+    eta_hw = 1.96 * se * np.abs(x_grid - x_grid.mean())
+
+    y_pred = np.exp(eta)
+    y_lo   = np.exp(eta - eta_hw)
+    y_hi   = np.exp(eta + eta_hw)
+
+    return x_grid, y_pred, y_lo, y_hi, var_vals.values, data_did['oop_expenditure'].values
+
+fig = plt.figure(figsize=(18, 11))
+fig.suptitle(
+    "Marginal Effect Plots — Predicted OOP Health Expenditure (Survey-Weighted PPML)\n"
+    "(Other predictors held at sample mean; cluster-robust SE by state)",
+    fontsize=14, fontweight='bold', y=1.01
+)
+gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+PALETTE = {'line': '#1f77b4', 'ci': '#aec7e8', 'scatter': '#ff7f0e', 'zero': '#d62728'}
+
+y_hi_clip = data_did['oop_expenditure'].quantile(0.95)
+
+for idx, var in enumerate(MARGINAL_VARS):
+    ax = fig.add_subplot(gs[idx // 3, idx % 3])
+    result = marginal_prediction(var)
+    if result is None:
+        ax.text(0.5, 0.5, f'{var}\nnot in model', ha='center', va='center',
+                transform=ax.transAxes, color='grey')
+        ax.set_title(VAR_LABELS.get(var, var), fontsize=10)
+        continue
+
+    x_grid, y_pred, y_lo, y_hi, x_act, y_act = result
+
+    jitter = np.random.default_rng(0).uniform(-0.15, 0.15, size=len(y_act))
+    ax.scatter(x_act, y_act + jitter, alpha=0.06, s=8, color=PALETTE['scatter'], label='Observed')
+    ax.fill_between(x_grid, y_lo, y_hi, color=PALETTE['ci'], alpha=0.55, label='95% CI')
+    ax.plot(x_grid, y_pred, color=PALETTE['line'], lw=2.2, label='Predicted E[OOP spend]')
+
+    coef_val = coef_table.loc[var, 'coef']
+    pval     = coef_table.loc[var, 'p_value']
+    star     = coef_table.loc[var, 'signif']
+    pct      = coef_table.loc[var, 'pct_change']
+    ax.annotate(
+        f"β={coef_val:.4f}{star}\n{pct:+.1f}%, p={pval:.3f}",
+        xy=(0.04, 0.92), xycoords='axes fraction', fontsize=8, va='top',
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='grey', alpha=0.8)
+    )
+
+    ax.set_title(VAR_LABELS.get(var, var), fontsize=10, fontweight='bold')
+    ax.set_xlabel(var, fontsize=8)
+    ax.set_ylabel('Predicted OOP spend (pesos)' if idx % 3 == 0 else '', fontsize=8)
+    ax.set_ylim(0, y_hi_clip)
+    ax.grid(True, alpha=0.25)
+    if idx == 0:
+        ax.legend(fontsize=7, loc='upper right')
+
+plt.savefig('resultados/marginal_effects_corrected_oophe.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Marginal effect plots saved to resultados/marginal_effects_corrected_oophe.png")
+```
+
+## 8. Coefficient Effect Plot
+
+```{python}
+#| label: fig-effect-plot
+
+EFFECT_VARS = list(VAR_LABELS.keys())
+
+plot_rows = coef_table.loc[[v for v in EFFECT_VARS if v in coef_table.index]].copy()
+plot_rows['ci90_lo'] = plot_rows['coef'] - 1.645 * plot_rows['std_err']
+plot_rows['ci90_hi'] = plot_rows['coef'] + 1.645 * plot_rows['std_err']
+plot_rows['ci95_lo'] = plot_rows['coef'] - 1.960 * plot_rows['std_err']
+plot_rows['ci95_hi'] = plot_rows['coef'] + 1.960 * plot_rows['std_err']
+plot_rows = plot_rows.sort_values('coef')
+
+labels = [VAR_LABELS.get(v, v) for v in plot_rows.index]
+y_pos  = np.arange(len(plot_rows))
+
+def dot_color(row):
+    if row['p_value'] < 0.01:  return '#1a6faf' if row['coef'] > 0 else '#c0392b'
+    if row['p_value'] < 0.05:  return '#5ba4d4' if row['coef'] > 0 else '#e67e73'
+    if row['p_value'] < 0.10:  return '#a8cce4' if row['coef'] > 0 else '#f1b9b5'
+    return '#b0b0b0'
+
+colors = [dot_color(row) for _, row in plot_rows.iterrows()]
+
+fig, ax = plt.subplots(figsize=(10, 6))
+for i, (_, row) in enumerate(plot_rows.iterrows()):
+    ax.plot([row['ci95_lo'], row['ci95_hi']], [y_pos[i], y_pos[i]], color=colors[i], lw=1.4, alpha=0.55, zorder=1)
+for i, (_, row) in enumerate(plot_rows.iterrows()):
+    ax.plot([row['ci90_lo'], row['ci90_hi']], [y_pos[i], y_pos[i]], color=colors[i], lw=4.5, alpha=0.80, solid_capstyle='round', zorder=2)
+
+ax.scatter(plot_rows['coef'], y_pos, color=colors, s=90, zorder=3, edgecolors='white', linewidths=0.8)
+for i, (_, row) in enumerate(plot_rows.iterrows()):
+    ax.text(row['ci95_hi'] + 0.001, y_pos[i], f"  {row['coef']:+.4f}{row['signif']}", va='center', fontsize=8.5, color='#333333')
+
+ax.axvline(0, color='#555555', lw=1.1, linestyle='--', alpha=0.7)
+for i in range(len(plot_rows)):
+    if i % 2 == 0:
+        ax.axhspan(y_pos[i] - 0.45, y_pos[i] + 0.45, color='#f5f5f5', zorder=0)
+
+ax.set_yticks(y_pos)
+ax.set_yticklabels(labels, fontsize=10)
+ax.set_xlabel('Coefficient estimate (log points; %-change = 100·(exp(β)−1))', fontsize=10)
+ax.set_title(
+    'Effect of Key Predictors on OOP Health Expenditure (Survey-Weighted PPML)\n'
+    'Thick bar = 90% CI  |  Thin bar = 95% CI  |  Dot = point estimate  |  SE clustered by state',
+    fontsize=11, fontweight='bold'
+)
+ax.grid(axis='x', alpha=0.3, linestyle=':')
+ax.spines[['top', 'right', 'left']].set_visible(False)
+ax.tick_params(left=False)
+
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='#1a6faf', label='Positive, p<0.01'),
+    Patch(facecolor='#5ba4d4', label='Positive, p<0.05'),
+    Patch(facecolor='#a8cce4', label='Positive, p<0.10'),
+    Patch(facecolor='#c0392b', label='Negative, p<0.01'),
+    Patch(facecolor='#e67e73', label='Negative, p<0.05'),
+    Patch(facecolor='#f1b9b5', label='Negative, p<0.10'),
+    Patch(facecolor='#b0b0b0', label='Not significant'),
+]
+ax.legend(handles=legend_elements, fontsize=8, loc='lower right', framealpha=0.9, title='Significance', title_fontsize=8)
+
+plt.tight_layout()
+plt.savefig('resultados/effect_plot_corrected_oophe.png', dpi=150, bbox_inches='tight')
+plt.savefig('resultados/figures/fig_effect_plot_oophe.svg', bbox_inches='tight')
+plt.savefig('resultados/figures/fig_effect_plot_oophe.pdf', bbox_inches='tight')
+plt.show()
+print('Effect plot saved to resultados/effect_plot_corrected_oophe.png and resultados/figures/fig_effect_plot_oophe.{svg,pdf}')
+```
+
+## Conclusion
+
+1. **The main model finds a +23.0% increase in expected out-of-pocket health spending following
+   IMSS-Bienestar affiliation** (95% CI +8.7% to +39.2%, p=0.001), and this holds up well across
+   most, though not all, ways of handling the ambiguous 2020 transition wave: the effect
+   strengthens under an earlier cutoff (`post = 2018`: +25.7%, p=0.003), remains significant when
+   2020 is dropped from the sample entirely (+17.0%, p=0.027), and is only rendered statistically
+   indistinguishable from zero under the later cutoff (`post = 2022`: +4.1%, p=0.419). Every
+   specification checked is directionally positive; five of seven reach conventional significance.
+2. **This still points to 2020 as the pivotal, genuinely ambiguous survey wave** — consistent with
+   affiliation rolling out through 2020-2021 rather than on a single date — but the finding is
+   noticeably less fragile to that choice than under a narrower control group: only the `post =
+   2022` recoding eliminates it, rather than both `post = 2022` and excl-2020 together. The paper
+   should still present the `post = 2020` result as the primary estimate but report `post = 2022`
+   alongside it as the one specification under which the effect is not detectable.
+3. **The traditional log-OLS/WLS approach agrees in direction** (+28.8% and +50.6%, respectively)
+   and, under this control group, both clear conventional significance (p=0.045 and p=0.027), no
+   longer only marginally so — though both still inflate the magnitude relative to PPML, consistent
+   with `log(1+y)` semi-elasticities being unreliable when a large zero mass is present (here, ~39%
+   of households report no OOP spending).
+4. **Household income and economic dependency are the strongest predictors of OOP spending**
+   (see §8): a one-unit increase in log household income is associated with a +140% increase in
+   expected OOP spend, and a one-unit increase in the economic dependency ratio with +72% — both
+   descriptive associations among controls, not causal claims, since neither is randomly assigned.
+5. **State-level supply covariates (hospital beds, doctors, outpatient consultations per 100k) are
+   not significant predictors** of household OOP spending once state and year fixed effects are
+   included — expected, since most of their variation is absorbed by the state fixed effects,
+   leaving only within-state, within-year movements to identify them.
